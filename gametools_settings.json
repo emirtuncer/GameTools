@@ -1,0 +1,13 @@
+{
+  "hk_mod": 3,
+  "hk_vk": 71,
+  "hk_label": "Ctrl+Alt+G",
+  "center": true,
+  "clip": true,
+  "remove_border": true,
+  "black_bg": false,
+  "mute_bg": true,
+  "custom_res": true,
+  "res_w": "2560",
+  "res_h": "1440"
+}

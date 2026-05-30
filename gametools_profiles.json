@@ -1,0 +1,46 @@
+{
+  "ReadyOrNotSteam-Win64-Shipping.exe": {
+    "favorite": true,
+    "center": true,
+    "clip": true,
+    "remove_border": true,
+    "black_bg": true,
+    "mute_bg": true,
+    "custom_res": true,
+    "res_w": 2560,
+    "res_h": 1440
+  },
+  "java.exe": {
+    "favorite": true,
+    "center": true,
+    "clip": true,
+    "remove_border": true,
+    "black_bg": false,
+    "mute_bg": true,
+    "custom_res": true,
+    "res_w": 2560,
+    "res_h": 1440
+  },
+  "Bodycam-Win64-Shipping.exe": {
+    "favorite": true,
+    "center": true,
+    "clip": true,
+    "remove_border": true,
+    "black_bg": false,
+    "mute_bg": true,
+    "custom_res": true,
+    "res_w": 2560,
+    "res_h": 1440
+  },
+  "ArmaReforgerSteam.exe": {
+    "favorite": true,
+    "center": true,
+    "clip": true,
+    "remove_border": true,
+    "black_bg": false,
+    "mute_bg": true,
+    "custom_res": true,
+    "res_w": 2560,
+    "res_h": 1440
+  }
+}

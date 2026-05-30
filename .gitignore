@@ -1,0 +1,10 @@
+GameTools*.exe
+bin/
+obj/
+dev/
+release/server/gametools-server
+xcuserdata/
+*.xcuserstate
+release/
+RemoteControl/
+publish/
