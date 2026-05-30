@@ -29,6 +29,7 @@ public class GameToolsForm : Form
     Form? blackBg;
     NotifyIcon? trayIcon;
     ContextMenuStrip? trayMenu;
+    bool exiting;
 
 
     // Original window state
@@ -71,6 +72,7 @@ public class GameToolsForm : Form
         LoadProfiles();
         LoadButtonProfiles();
         BuildUI();
+        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch (Exception ex) { Debug.WriteLine("Load icon: " + ex.Message); }
         WindowState = FormWindowState.Minimized;
         Win32.RegisterHotKey(Handle, HOTKEY_ID, hkMod | Win32.MOD_NOREPEAT, hkVk);
         RegisterRawInput();
@@ -122,7 +124,7 @@ public class GameToolsForm : Form
         chkBorder = Theme.MakeCheck("Remove window border");
         chkBlackBg = Theme.MakeCheck("Black background (hide desktop)");
         chkMute = Theme.MakeCheck("Mute audio when in background");
-        profileList = Theme.MakeListView(356, 95);
+        profileList = Theme.MakeListView(356, 180);
         profileList.Columns.Add("\u2605", 28);
         profileList.Columns.Add("Process", 140);
         profileList.Columns.Add("Settings", 180);
@@ -153,7 +155,7 @@ public class GameToolsForm : Form
 
         trayMenu = new ContextMenuStrip();
         trayMenu.Items.Add("Show", null, (_, _) => RestoreFromTray());
-        trayMenu.Items.Add("Exit", null, (_, _) => { if (trayIcon != null) trayIcon.Visible = false; Close(); });
+        trayMenu.Items.Add("Exit", null, (_, _) => { exiting = true; if (trayIcon != null) trayIcon.Visible = false; Close(); });
         trayIcon = new NotifyIcon
         {
             Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath),
@@ -1176,5 +1178,18 @@ public class GameToolsForm : Form
         try { SaveSettings(); SaveProfiles(); } catch (Exception ex) { Debug.WriteLine("Cleanup save: " + ex.Message); }
     }
 
-    protected override void OnFormClosing(FormClosingEventArgs e) { Cleanup(); base.OnFormClosing(e); }
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        // Close (X) / Alt+F4 hides to tray instead of exiting when tray mode is on.
+        // The tray "Exit" menu sets `exiting` first so it still quits for real.
+        if (!exiting && e.CloseReason == CloseReason.UserClosing && chkTrayMode?.Checked == true)
+        {
+            e.Cancel = true;
+            Hide();
+            if (trayIcon != null) trayIcon.Visible = true;
+            return;
+        }
+        Cleanup();
+        base.OnFormClosing(e);
+    }
 }
