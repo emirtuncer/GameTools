@@ -493,9 +493,22 @@ public class GameToolsForm : Form
     void ToggleFavorite()
     {
         string? exe = SelectedExe(); if (exe == null) return;
-        profiles[exe].Favorite = !profiles[exe].Favorite;
+        bool nowFav = profiles[exe].Favorite = !profiles[exe].Favorite;
         SaveProfiles(); RefreshProfileList();
-        Status($"{exe} {(profiles[exe].Favorite ? "favorited" : "unfavorited")}");
+        Status($"{exe} {(nowFav ? "favorited" : "unfavorited")}");
+
+        // Auto-apply immediately if the favorited window is already open
+        if (!nowFav) return;
+        try
+        {
+            var win = WindowHelper.GetWindows()
+                .Where(w => w.Width > Constants.MinWindowSize && w.Height > Constants.MinWindowSize)
+                .FirstOrDefault(w => string.Equals(w.Process, exe, StringComparison.OrdinalIgnoreCase));
+            if (win == null) return;
+            lock (_appliedPidsLock) appliedPids.Add(win.Pid);
+            ApplyProfileActions(win.Hwnd, profiles[exe]);
+        }
+        catch (Exception ex) { Debug.WriteLine("Favorite auto-apply: " + ex.Message); }
     }
 
     void LoadSelectedProfile()
@@ -624,8 +637,22 @@ public class GameToolsForm : Form
         if (chkClip.Checked) { StartMonitoring(); actions.Add("clip"); }
         if (chkBlackBg.Checked) { ShowBlackBg(); actions.Add("blackbg"); }
         UpdateTargetDisplay();
-        Status(actions.Count > 0 ? "Applied: " + string.Join(", ", actions) : "No actions selected");
         SaveSettings();
+
+        if (!string.IsNullOrEmpty(targetProcess))
+        {
+            var p = GetCurrentOpts();
+            if (profiles.TryGetValue(targetProcess, out var existing)) p.Favorite = existing.Favorite;
+            profiles[targetProcess] = p;
+            SaveProfiles(); RefreshProfileList();
+            Status(actions.Count > 0
+                ? $"Applied: {string.Join(", ", actions)} · profile saved: {targetProcess}"
+                : $"Profile saved: {targetProcess}");
+        }
+        else
+        {
+            Status(actions.Count > 0 ? "Applied: " + string.Join(", ", actions) : "No actions selected");
+        }
     }
 
     void ApplyProfileActions(IntPtr hwnd, GameProfile p)
