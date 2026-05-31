@@ -17,7 +17,6 @@
 - **Window Centering & Resizing** — Center the game on your monitor and resize to a custom resolution (default 2560×1440)
 - **Black Background** — Overlay to hide the desktop behind your game window
 - **Audio Mute on Alt+Tab** — Automatically mute the game when you switch away, unmute when you return
-- **FPS Overlay** — Real-time framerate display using DWM composition timing
 - **Game Profiles** — Save per-game settings that persist across sessions. Applying settings now also saves the profile automatically
 - **Favorites & Auto-Detect** — Mark profiles as favorites to auto-apply settings when the game launches. Favoriting an already-open game applies instantly
 - **Global Hotkey** — Trigger capture from anywhere (default: `Ctrl+Alt+G`, customizable)
@@ -59,7 +58,7 @@ GameTools/
 ├── assets/         # Application icon and logo
 ├── Core/           # Win32 wrappers, window/audio control
 ├── Data/           # Profiles, settings, JSON serialization
-├── UI/             # Main form, FPS overlay, theming (Catppuccin Mocha dark theme)
+├── UI/             # Main form, theming (Catppuccin Mocha dark theme)
 ├── Layout/         # Flexbox-like layout helpers for WinForms
 ├── Program.cs      # Entry point (single-instance enforcement)
 └── GameTools.csproj
@@ -68,4 +67,3 @@ GameTools/
 ## License
 
 All rights reserved.
-</content>
