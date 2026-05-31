@@ -6,7 +6,7 @@
 
 <p align="center">
   A Windows utility for optimizing the gaming experience — window management, cursor
-  confinement, audio control, virtual gamepad, and a phone remote. Built with .NET 9.0 WinForms.
+  confinement, and audio control. Built with .NET 9.0 WinForms.
 </p>
 
 ## Features
@@ -18,10 +18,8 @@
 - **Black Background** — Overlay to hide the desktop behind your game window
 - **Audio Mute on Alt+Tab** — Automatically mute the game when you switch away, unmute when you return
 - **FPS Overlay** — Real-time framerate display using DWM composition timing
-- **Virtual Gamepad** — Emulate an Xbox controller via ViGEmBus; maps raw mouse motion to the right analog stick for aim
 - **Game Profiles** — Save per-game settings that persist across sessions. Applying settings now also saves the profile automatically
 - **Favorites & Auto-Detect** — Mark profiles as favorites to auto-apply settings when the game launches. Favoriting an already-open game applies instantly
-- **Remote Control** — Companion phone app controls GameTools over your local network (HTTP on port 9876, auto-discovered via UDP)
 - **Global Hotkey** — Trigger capture from anywhere (default: `Ctrl+Alt+G`, customizable)
 - **Start with Windows** — Optional startup entry via the Windows registry
 - **System Tray** — Minimize to tray to keep it out of the way; with tray mode on, closing the window hides it instead of quitting
@@ -30,7 +28,6 @@
 
 - Windows 10/11 (64-bit)
 - .NET 9.0 Runtime (or use the self-contained release)
-- [ViGEmBus](https://github.com/nefarius/ViGEmBus) driver — only required for the Virtual Gamepad feature
 
 ## Installation
 
@@ -60,7 +57,7 @@ Settings and profiles are stored as JSON files next to the executable:
 ```
 GameTools/
 ├── assets/         # Application icon and logo
-├── Core/           # Win32 wrappers, window/audio control, gamepad emulation, web server
+├── Core/           # Win32 wrappers, window/audio control
 ├── Data/           # Profiles, settings, JSON serialization
 ├── UI/             # Main form, FPS overlay, theming (Catppuccin Mocha dark theme)
 ├── Layout/         # Flexbox-like layout helpers for WinForms
