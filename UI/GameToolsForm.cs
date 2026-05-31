@@ -66,14 +66,19 @@ public class GameToolsForm : Form
 
     Dictionary<string, object>? _cachedSettings;
 
-    public GameToolsForm()
+    public GameToolsForm(bool startMinimized = false)
     {
         LoadSettings();
         LoadProfiles();
         LoadButtonProfiles();
         BuildUI();
+        // Create the JSON files on first launch (BuildUI has applied loaded/default state by now),
+        // so they exist from start rather than only appearing after a save or on close.
+        try { if (!File.Exists(SettingsPath)) SaveSettings(); } catch (Exception ex) { Debug.WriteLine("Init settings: " + ex.Message); }
+        try { if (!File.Exists(ProfilesPath)) SaveProfiles(); } catch (Exception ex) { Debug.WriteLine("Init profiles: " + ex.Message); }
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch (Exception ex) { Debug.WriteLine("Load icon: " + ex.Message); }
-        WindowState = FormWindowState.Minimized;
+        // Only start hidden when launched at Windows startup (--minimized); a manual launch opens in front.
+        WindowState = startMinimized ? FormWindowState.Minimized : FormWindowState.Normal;
         Win32.RegisterHotKey(Handle, HOTKEY_ID, hkMod | Win32.MOD_NOREPEAT, hkVk);
         RegisterRawInput();
         autoDetectThread = new Thread(AutoDetectLoop) { IsBackground = true };
@@ -258,12 +263,47 @@ public class GameToolsForm : Form
     const string StartupRegKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
     const string StartupValueName = "GameTools";
 
+    static string? GetStartupValue()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(StartupRegKey, false);
+        return key?.GetValue(StartupValueName) as string;
+    }
+
+    // Pull the exe path out of a Run command like: "C:\path\GameTools.exe" --minimized
+    static string ExtractExePath(string command)
+    {
+        command = command.Trim();
+        if (command.StartsWith("\""))
+        {
+            int end = command.IndexOf('"', 1);
+            if (end > 0) return command.Substring(1, end - 1);
+        }
+        int sp = command.IndexOf(' ');
+        return sp > 0 ? command.Substring(0, sp) : command;
+    }
+
+    static bool PathsEqual(string a, string b)
+    {
+        try { return string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase); }
+        catch { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
+    }
+
+    // True only when the Run entry exists AND points to *this* exe. A different copy reads as
+    // disabled (so its checkbox is accurate), and a dead entry (target deleted) is cleaned up.
     static bool IsStartupEnabled()
     {
         try
         {
-            using var key = Registry.CurrentUser.OpenSubKey(StartupRegKey, false);
-            return key?.GetValue(StartupValueName) != null;
+            var val = GetStartupValue();
+            if (string.IsNullOrWhiteSpace(val)) return false;
+            var exe = ExtractExePath(val);
+            if (!File.Exists(exe))
+            {
+                try { using var k = Registry.CurrentUser.OpenSubKey(StartupRegKey, true); k?.DeleteValue(StartupValueName, false); }
+                catch (Exception ex) { Debug.WriteLine("Startup stale cleanup: " + ex.Message); }
+                return false;
+            }
+            return PathsEqual(exe, Application.ExecutablePath);
         }
         catch { return false; }
     }
@@ -275,7 +315,7 @@ public class GameToolsForm : Form
             using var key = Registry.CurrentUser.OpenSubKey(StartupRegKey, true);
             if (key == null) return;
             if (enable)
-                key.SetValue(StartupValueName, $"\"{Application.ExecutablePath}\"");
+                key.SetValue(StartupValueName, $"\"{Application.ExecutablePath}\" --minimized");
             else
                 key.DeleteValue(StartupValueName, false);
         }
@@ -834,6 +874,18 @@ public class GameToolsForm : Form
         }
     }
 
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        // Ensure a normal (non-startup) launch grabs the foreground.
+        if (WindowState != FormWindowState.Minimized)
+        {
+            Show();
+            Activate();
+            BringToFront();
+        }
+    }
+
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
@@ -1151,7 +1203,9 @@ public class GameToolsForm : Form
         cleanedUp = true;
         running = false;
 
-        try { clipRunning = false; clipThread?.Join(Constants.ThreadJoinMs); } catch (Exception ex) { Debug.WriteLine("Cleanup clip: " + ex.Message); }
+        // Signal the clip loop to stop but don't block on Join — it's a background thread that
+        // dies on process exit, and the cursor clip is released below (and by the OS on exit).
+        clipRunning = false;
         try { Win32.ClipCursor(IntPtr.Zero); } catch (Exception ex) { Debug.WriteLine("Cleanup cursor: " + ex.Message); }
         try { if (targetPid != 0) AudioMuter.SetMute(targetPid, false); } catch (Exception ex) { Debug.WriteLine("Cleanup unmute: " + ex.Message); }
         try
@@ -1175,7 +1229,10 @@ public class GameToolsForm : Form
         try { trayMenu?.Dispose(); trayMenu = null; } catch (Exception ex) { Debug.WriteLine("Cleanup trayMenu: " + ex.Message); }
         try { Win32.UnregisterHotKey(Handle, HOTKEY_ID); } catch (Exception ex) { Debug.WriteLine("Cleanup hotkey: " + ex.Message); }
         try { webServer?.Dispose(); webServer = null; } catch (Exception ex) { Debug.WriteLine("Cleanup webserver: " + ex.Message); }
-        try { SaveSettings(); SaveProfiles(); } catch (Exception ex) { Debug.WriteLine("Cleanup save: " + ex.Message); }
+        // Only settings are saved here; profiles are already persisted on every change
+        // (apply / favorite / save / delete), so re-writing the profiles file on close is
+        // redundant and was causing churn.
+        try { SaveSettings(); } catch (Exception ex) { Debug.WriteLine("Cleanup save: " + ex.Message); }
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)

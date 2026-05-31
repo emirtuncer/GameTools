@@ -14,9 +14,13 @@ if (!created)
 Application.EnableVisualStyles();
 Application.SetCompatibleTextRenderingDefault(false);
 
+bool startMinimized = args.Any(a =>
+    a.Equals("--minimized", StringComparison.OrdinalIgnoreCase) ||
+    a.Equals("--startup", StringComparison.OrdinalIgnoreCase));
+
 try
 {
-    Application.Run(new GameToolsForm());
+    Application.Run(new GameToolsForm(startMinimized));
 }
 catch (Exception ex)
 {

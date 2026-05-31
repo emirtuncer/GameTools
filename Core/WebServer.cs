@@ -13,6 +13,7 @@ public class WebServer : IDisposable
     readonly CancellationTokenSource _cts = new();
     Thread? _thread;
     Thread? _discoveryThread;
+    UdpClient? _udp;
 
     // Callbacks wired by GameToolsForm
     public Func<Dictionary<string, object>>? GetSettings { get; set; }
@@ -393,6 +394,7 @@ public class WebServer : IDisposable
         try
         {
             using var udp = new UdpClient(47777);
+            _udp = udp; // tracked so Dispose() can close it and unblock the blocking Receive() below
             udp.EnableBroadcast = true;
             var response = Encoding.UTF8.GetBytes($"GAMETOOLS_SERVER:{httpPort}");
 
@@ -421,8 +423,11 @@ public class WebServer : IDisposable
         _cts.Cancel();
         try { _listener.Stop(); } catch { }
         try { _listener.Close(); } catch { }
-        _thread?.Join(2000);
-        _discoveryThread?.Join(1000);
-        _cts.Dispose();
+        try { _udp?.Close(); } catch { } // unblocks the discovery thread stuck in udp.Receive()
+        // Both threads are now unblocked (listener via Stop/Close, discovery via udp.Close),
+        // so these joins return in milliseconds instead of waiting out the timeout.
+        _thread?.Join(200);
+        _discoveryThread?.Join(200);
+        try { _cts.Dispose(); } catch { }
     }
 }
