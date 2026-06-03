@@ -739,8 +739,14 @@ public class GameToolsForm : Form
             Win32.SetWindowPos(targetHwnd, Win32.HWND_NOTOPMOST, x, y, w, h,
                 Win32.SWP_NOACTIVATE | Win32.SWP_FRAMECHANGED);
             hasOriginalState = false;
-            UpdateTargetDisplay();
         }
+        // Clear target state so AutoDetectLoop's auto-release guard (targetPid != 0)
+        // stops firing on the dead PID and resumes evaluating favorites. Without this,
+        // favorite auto-load silently dies after the first favorited game is closed.
+        targetHwnd = IntPtr.Zero;
+        targetPid = 0;
+        targetProcess = null;
+        UpdateTargetDisplay();
         Status("Released");
     }
 

@@ -22,10 +22,13 @@ public static class WindowHelper
             Win32.GetWindowThreadProcessId(hwnd, out uint pid);
             Win32.GetWindowRect(hwnd, out Win32.RECT r);
 
+            // Resolve the owning process name. A protected/elevated process (e.g. anti-cheat
+            // games) can throw Win32Exception "Access is denied" from .ProcessName; swallow ALL
+            // exceptions so one unreadable window can't abort the entire EnumWindows sweep and
+            // silently break favorite auto-detect.
             string proc = "unknown";
             try { proc = Process.GetProcessById((int)pid).ProcessName + ".exe"; }
-            catch (ArgumentException) { }
-            catch (InvalidOperationException) { }
+            catch (Exception) { }
 
             list.Add(new WindowInfo(hwnd, new string(buf, 0, len), proc, pid,
                 r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top));
@@ -43,8 +46,7 @@ public static class WindowHelper
         Win32.GetWindowRect(hwnd, out Win32.RECT r);
         string proc = "unknown";
         try { proc = Process.GetProcessById((int)pid).ProcessName + ".exe"; }
-        catch (ArgumentException) { }
-        catch (InvalidOperationException) { }
+        catch (Exception) { }
         return new WindowInfo(hwnd, new string(buf, 0, Math.Max(len, 0)), proc, pid,
             r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top);
     }
