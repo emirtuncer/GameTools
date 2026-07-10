@@ -200,9 +200,13 @@ public static class GamepadEmulator
         }
         else
         {
-            // Ease back to center
-            _rightX = Lerp(_rightX, 0, smooth * 0.5f);
-            _rightY = Lerp(_rightY, 0, smooth * 0.5f);
+            // Ease back to center over the configured decay time (frame-rate
+            // independent, mirroring how RampDownMs governs the left stick's release).
+            float decayRate = _settings.MouseDecayMs > 0
+                ? Math.Clamp(dtMs / _settings.MouseDecayMs, 0f, 1f)
+                : 1f;
+            _rightX = Lerp(_rightX, 0, decayRate);
+            _rightY = Lerp(_rightY, 0, decayRate);
             // Snap to zero when close enough
             if (MathF.Abs(_rightX) < 0.01f) _rightX = 0;
             if (MathF.Abs(_rightY) < 0.01f) _rightY = 0;
