@@ -12,6 +12,10 @@ public class GameProfile
     public int ResW { get; set; } = GameTools.Core.Constants.DefaultResW;
     public int ResH { get; set; } = GameTools.Core.Constants.DefaultResH;
     public GamepadSettings Gamepad { get; set; } = new();
+    // Unix seconds of the last time this profile was applied to a window; 0 = never.
+    public long LastUsed { get; set; }
+
+    public GameProfile Clone() => FromDict(ToDict());
 
     public string Summary()
     {
@@ -32,7 +36,8 @@ public class GameProfile
         {
             ["favorite"] = Favorite, ["center"] = Center, ["clip"] = Clip,
             ["remove_border"] = RemoveBorder, ["black_bg"] = BlackBg, ["mute_bg"] = MuteBg,
-            ["custom_res"] = CustomRes, ["res_w"] = ResW, ["res_h"] = ResH
+            ["custom_res"] = CustomRes, ["res_w"] = ResW, ["res_h"] = ResH,
+            ["last_used"] = LastUsed
         };
         foreach (var kv in Gamepad.ToDict()) d[kv.Key] = kv.Value;
         return d;
@@ -50,6 +55,7 @@ public class GameProfile
         if (d.TryGetValue("custom_res", out v)) p.CustomRes = Convert.ToBoolean(v);
         if (d.TryGetValue("res_w", out v)) p.ResW = Convert.ToInt32(v);
         if (d.TryGetValue("res_h", out v)) p.ResH = Convert.ToInt32(v);
+        if (d.TryGetValue("last_used", out v)) p.LastUsed = Convert.ToInt64(v);
         p.Gamepad = GamepadSettings.FromDict(d);
         return p;
     }

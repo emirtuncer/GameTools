@@ -30,6 +30,7 @@ public class GameToolsForm : Form
     NotifyIcon? trayIcon;
     ContextMenuStrip? trayMenu;
     bool exiting;
+    bool trayMode;
 
 
     // Original window state
@@ -39,6 +40,8 @@ public class GameToolsForm : Form
     readonly object _appliedPidsLock = new();
     HashSet<uint> appliedPids = [];
     Dictionary<string, GameProfile> profiles = new(StringComparer.OrdinalIgnoreCase);
+    // Settings used for a newly captured game that has no profile yet.
+    GameProfile defaults = new();
 
     // Hotkey
     uint hkMod = Win32.MOD_CONTROL | Win32.MOD_ALT, hkVk = 0x47;
@@ -46,11 +49,19 @@ public class GameToolsForm : Form
     const int HOTKEY_ID = 9001;
 
     // Controls
-    Label lblTargetTitle = null!, lblTargetInfo = null!, lblStatus = null!, lblHotkey = null!;
-    Button btnCapture = null!;
-    CheckBox chkCustomRes = null!, chkCenter = null!, chkClip = null!, chkBorder = null!, chkBlackBg = null!, chkMute = null!, chkTrayMode = null!;
-    TextBox txtResW = null!, txtResH = null!;
-    ListView profileList = null!;
+    Label lblTarget = null!, lblStatus = null!, lblHotkeyHint = null!, lblListEmpty = null!;
+    ModernButton btnCapture = null!;
+    InputBox search = null!;
+    ProfileList profileList = null!;
+    ProfileDetailView detail = null!;
+    string? selectedExe;
+    bool loadingDetail;
+    Anim statusFlash = null!;
+
+    // Running-process indicator for the list
+    HashSet<string> runningExes = new(StringComparer.OrdinalIgnoreCase);
+    System.Windows.Forms.Timer? runningTimer;
+    bool refreshingRunning;
 
     // Gamepad controls
     CheckBox chkGamepad = null!, chkWasd = null!, chkMouse = null!, chkInvertRX = null!, chkInvertRY = null!;
@@ -105,59 +116,108 @@ public class GameToolsForm : Form
     {
         var ver = Assembly.GetExecutingAssembly().GetName().Version!;
         Text = $"GameTools v{ver.Major}.{ver.Minor}.{ver.Build}";
-        FormBorderStyle = FormBorderStyle.FixedSingle;
-        MaximizeBox = false;
-        StartPosition = FormStartPosition.CenterScreen;
-        BackColor = Theme.BG;
-        ForeColor = Theme.FG;
-        Font = Theme.Normal;
+        AutoScaleDimensions = new SizeF(96F, 96F);
         AutoScaleMode = AutoScaleMode.Dpi;
+        FormBorderStyle = FormBorderStyle.Sizable;
+        StartPosition = FormStartPosition.CenterScreen;
+        BackColor = Theme.Mantle;
+        ForeColor = Theme.FG;
+        Font = Theme.Body;
+        ClientSize = new Size(840, 640);
+        MinimumSize = new Size(720, 520);
+        KeyPreview = true;
 
-        const int contentW = 376;
+        BuildTray();
+        BuildGamepadControls();
 
-        lblTargetTitle = Theme.MakeLabel("(no window selected)", bold: true);
-        lblTargetInfo = Theme.MakeLabel("Click Capture or press hotkey", Theme.Dim);
+        // Header: logo, title, active-game indicator, settings
+        var header = new Panel { Dock = DockStyle.Top, Height = 60, Padding = new Padding(18, 0, 12, 0) };
+        var logo = new PictureBox { Size = new Size(28, 28), Location = new Point(18, 16), SizeMode = PictureBoxSizeMode.Zoom };
+        try { logo.Image = new Icon(Icon.ExtractAssociatedIcon(Application.ExecutablePath)!, 32, 32).ToBitmap(); } catch (Exception ex) { Debug.WriteLine("Logo: " + ex.Message); }
+        var lblTitle = new Label { Text = "GameTools", Font = Theme.Heading, ForeColor = Theme.FG, AutoSize = true, Location = new Point(54, 18) };
+        var lblVer = new Label { Text = $"v{ver.Major}.{ver.Minor}.{ver.Build}", Font = Theme.Caption, ForeColor = Theme.Dim, AutoSize = true, Location = new Point(150, 22) };
+        lblTitle.SizeChanged += (_, _) => lblVer.Left = lblTitle.Right + 4;
 
-        btnCapture = Theme.MakeAccentButton("Capture Window  (5s delay)", contentW);
+        lblTarget = new Label { Font = Theme.Caption, AutoSize = true, Margin = new Padding(0, 22, 12, 0) };
+        var btnSettings = new ModernButton { Kind = ButtonKind.Ghost, Glyph = Theme.GlyphSettings, Size = new Size(38, 38), Margin = new Padding(0, 11, 0, 0) };
+        btnSettings.Click += (_, _) => OpenSettings();
+        var headerRight = new FlowLayoutPanel { Dock = DockStyle.Right, AutoSize = true, WrapContents = false };
+        headerRight.Controls.AddRange([lblTarget, btnSettings]);
+        header.Controls.AddRange([logo, lblTitle, lblVer, headerRight]);
+
+        // Footer: status + hotkey hint
+        var footer = new Panel { Dock = DockStyle.Bottom, Height = 30, BackColor = Theme.Crust, Padding = new Padding(18, 0, 18, 0) };
+        lblStatus = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Theme.Subtext, Font = Theme.Caption, AutoEllipsis = true, Text = "Ready" };
+        lblHotkeyHint = new Label { Dock = DockStyle.Right, Width = 220, TextAlign = ContentAlignment.MiddleRight, ForeColor = Theme.Dim, Font = Theme.Caption };
+        statusFlash = new Anim(0, () => lblStatus.ForeColor = Theme.Blend(Theme.Subtext, Theme.Accent, statusFlash.Value), 900);
+        footer.Controls.Add(lblStatus);
+        footer.Controls.Add(lblHotkeyHint);
+
+        // Left column: search, game list, capture
+        search = new InputBox(Theme.GlyphSearch, "Search games  (Ctrl+F)");
+        search.Box.TextChanged += (_, _) => RefreshProfileList();
+        search.Box.KeyDown += OnSearchKeyDown;
+
+        profileList = new ProfileList { Dock = DockStyle.Fill };
+        profileList.SelectedIndexChanged += (_, _) => OnListSelectionChanged();
+        profileList.ItemActivated += (_, _) => ApplySelected();
+        // No Enter-to-apply: the window grabs focus on launch, and a stray Enter must not move a window.
+        profileList.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.Delete) { DeleteSelectedProfile(); e.SuppressKeyPress = true; }
+        };
+        lblListEmpty = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.TopCenter, ForeColor = Theme.Dim, Padding = new Padding(8, 24, 8, 0), Visible = false };
+        var listHost = new Panel { Dock = DockStyle.Fill };
+        listHost.Controls.Add(profileList);
+        listHost.Controls.Add(lblListEmpty);
+
+        btnCapture = new ModernButton { Kind = ButtonKind.Accent, Text = "Capture window", Glyph = Theme.GlyphAdd, Height = 42, Dock = DockStyle.Bottom };
         btnCapture.Click += (_, _) => StartCapture();
+        new ToolTip().SetToolTip(btnCapture, "Switch to your game within 5 seconds; its window gets captured and set up");
 
-        chkCustomRes = Theme.MakeCheck("Resize to:");
-        txtResW = Theme.MakeTextBox(Constants.DefaultResW.ToString());
-        txtResH = Theme.MakeTextBox(Constants.DefaultResH.ToString());
-        chkCenter = Theme.MakeCheck("Center on monitor"); chkCenter.Checked = true;
-        chkClip = Theme.MakeCheck("Clip cursor to window"); chkClip.Checked = true;
-        chkBorder = Theme.MakeCheck("Remove window border");
-        chkBlackBg = Theme.MakeCheck("Black background (hide desktop)");
-        chkMute = Theme.MakeCheck("Mute audio when in background");
-        profileList = Theme.MakeListView(356, 180);
-        profileList.Columns.Add("\u2605", 28);
-        profileList.Columns.Add("Process", 140);
-        profileList.Columns.Add("Settings", 180);
-        profileList.DoubleClick += (_, _) => LoadSelectedProfile();
+        var left = new Panel { Dock = DockStyle.Left, Width = 300, Padding = new Padding(14, 2, 8, 14) };
+        left.Controls.Add(listHost);
+        left.Controls.Add(Stacking.Spacer(10));
+        left.Controls.Add(search);
+        search.Dock = DockStyle.Top;
+        left.Controls.Add(new Panel { Height = 10, Dock = DockStyle.Bottom });
+        left.Controls.Add(btnCapture);
 
-        var btnSave = Theme.MakeButton("Save Current"); btnSave.Click += (_, _) => SaveCurrentProfile();
-        var btnFav = Theme.MakeButton("Favorite"); btnFav.Click += (_, _) => ToggleFavorite();
-        var btnLoad = Theme.MakeButton("Load"); btnLoad.Click += (_, _) => LoadSelectedProfile();
-        var btnDelete = Theme.MakeButton("Delete"); btnDelete.Click += (_, _) => DeleteSelectedProfile();
-        var lblProfHint = Theme.MakeLabel("Favorited profiles auto-apply when game launches", Theme.Dim, 8);
+        // Right: detail card for the selected profile
+        detail = new ProfileDetailView { Dock = DockStyle.Fill };
+        detail.Changed += OnDetailChanged;
+        detail.ApplyClicked += ApplySelected;
+        detail.ReleaseClicked += Release;
+        detail.FavoriteClicked += ToggleFavorite;
+        detail.DeleteClicked += DeleteSelectedProfile;
+        if (Constants.GamepadPluginEnabled) detail.AddSection(GamepadPluginGroup(340));
+        var right = new Panel { Dock = DockStyle.Fill, Padding = new Padding(8, 2, 14, 14) };
+        right.Controls.Add(detail);
 
-        var lblHkCapture = Theme.MakeLabel("Capture + Apply:");
-        lblHotkey = Theme.MakeLabel(hkLabel, Theme.Yellow, 11, bold: true);
-        var btnChangeHk = Theme.MakeButton("Change", 80); btnChangeHk.Click += (_, _) => ChangeHotkey();
-        var lblHkHint = Theme.MakeLabel("Press hotkey anywhere to start 5s capture + apply", Theme.Dim, 8);
+        // WinForms docks the last-added control first, so the edges go in after the fill.
+        Controls.Add(right);
+        Controls.Add(left);
+        Controls.Add(header);
+        Controls.Add(footer);
 
-        var btnRelease = Theme.MakeButton("Release", 118); btnRelease.Click += (_, _) => Release();
+        ApplyUiSettings();
+        UpdateHotkeyHint();
+        UpdateTargetDisplay();
+        RefreshProfileList();
+        detail.ShowEmpty();
+        // Start focus in search, where a stray Enter/Space is harmless (a focused button would capture/apply).
+        ActiveControl = search.Box;
+        if (profiles.Count > 0)
+            lblStatus.Text = $"Loaded {profiles.Count} profile(s)";
 
-        var chkStartup = Theme.MakeCheck("Start with Windows");
-        chkStartup.ForeColor = Theme.Dim;
-        chkStartup.Font = Theme.Small;
-        chkStartup.Checked = IsStartupEnabled();
-        chkStartup.CheckedChanged += (_, _) => SetStartupEnabled(chkStartup.Checked);
+        runningTimer = new System.Windows.Forms.Timer { Interval = 2000 };
+        runningTimer.Tick += (_, _) => RefreshRunning();
+        runningTimer.Start();
+        RefreshRunning();
+    }
 
-        chkTrayMode = Theme.MakeCheck("Minimize to Tray");
-        chkTrayMode.ForeColor = Theme.Dim;
-        chkTrayMode.Font = Theme.Small;
-
+    void BuildTray()
+    {
         trayMenu = new ContextMenuStrip();
         trayMenu.Items.Add("Show", null, (_, _) => RestoreFromTray());
         trayMenu.Items.Add("Exit", null, (_, _) => { exiting = true; if (trayIcon != null) trayIcon.Visible = false; Close(); });
@@ -169,8 +229,10 @@ public class GameToolsForm : Form
             Visible = false
         };
         trayIcon.DoubleClick += (_, _) => RestoreFromTray();
+    }
 
-        // Virtual Gamepad
+    void BuildGamepadControls()
+    {
         vigemAvailable = GamepadEmulator.IsDriverAvailable();
 
         chkGamepad = Theme.MakeCheck("Enable Virtual Gamepad");
@@ -211,42 +273,24 @@ public class GameToolsForm : Form
         lblBarS = Theme.MakeLabel("S: 0%", Theme.Dim, 8);
         lblBarD = Theme.MakeLabel("D: 0%", Theme.Dim, 8);
 
-        lblStatus = new Label
+        // Gamepad tuning is stored per profile, so edits save like the other detail options.
+        if (Constants.GamepadPluginEnabled)
         {
-            Text = "Ready",
-            Size = new Size(contentW, 26),
-            BackColor = Theme.BG2,
-            ForeColor = Theme.Green,
-            Font = Theme.Normal,
-            TextAlign = ContentAlignment.MiddleLeft,
-            Padding = new Padding(8, 0, 0, 0)
-        };
+            foreach (var c in new[] { chkWasd, chkMouse, chkInvertRX, chkInvertRY }) c.CheckedChanged += (_, _) => OnDetailChanged();
+            foreach (var t in new[] { trkRampUp, trkRampDown, trkSensitivity }) t.ValueChanged += (_, _) => OnDetailChanged();
+        }
+    }
 
-        Flex.Apply(this, gap: 12, padding: new Padding(12),
-            Flex.Group("Target Window", Theme.Bold, Theme.Accent, 4, contentW,
-                lblTargetTitle,
-                lblTargetInfo),
-            btnCapture,
-            Flex.Group("Options", Theme.Bold, Theme.Accent, 4, contentW,
-                Flex.Row(8, chkCustomRes, txtResW, Theme.MakeLabel("x"), txtResH),
-                chkCenter, chkClip, chkBorder, chkBlackBg, chkMute),
-            GamepadPluginGroup(contentW),
-            Flex.Group("Game Profiles", Theme.Bold, Theme.Accent, 8, contentW,
-                profileList,
-                Flex.Row(6, btnSave, btnFav, btnLoad, btnDelete),
-                lblProfHint),
-            Flex.Group("Hotkey", Theme.Bold, Theme.Accent, 4, contentW,
-                Flex.Row(8, lblHkCapture, lblHotkey, btnChangeHk),
-                lblHkHint),
-            btnRelease,
-            Flex.Row(8, chkStartup, chkTrayMode),
-            lblStatus
-        );
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        Theme.ApplyWindowChrome(this);
+    }
 
-        ApplyUiSettings();
-        RefreshProfileList();
-        if (profiles.Count > 0)
-            lblStatus.Text = $"Loaded {profiles.Count} profile(s)";
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (keyData == (Keys.Control | Keys.F)) { search.Box.Focus(); search.Box.SelectAll(); return true; }
+        return base.ProcessCmdKey(ref msg, keyData);
     }
 
     void Status(string text)
@@ -254,10 +298,19 @@ public class GameToolsForm : Form
         if (IsDisposed || !IsHandleCreated) return;
         if (InvokeRequired)
         {
-            try { Invoke(() => { if (!IsDisposed) lblStatus.Text = text; }); }
+            try { Invoke(() => { if (!IsDisposed) SetStatus(text); }); }
             catch (ObjectDisposedException) { }
         }
-        else lblStatus.Text = text;
+        else SetStatus(text);
+    }
+
+    // New messages flash in the accent color, then settle back to the normal status color.
+    void SetStatus(string text)
+    {
+        if (lblStatus.Text == text) return;
+        lblStatus.Text = text;
+        statusFlash.Snap(1);
+        statusFlash.To(0);
     }
 
     const string StartupRegKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
@@ -289,7 +342,7 @@ public class GameToolsForm : Form
     }
 
     // True only when the Run entry exists AND points to *this* exe. A different copy reads as
-    // disabled (so its checkbox is accurate), and a dead entry (target deleted) is cleaned up.
+    // disabled (so its toggle is accurate), and a dead entry (target deleted) is cleaned up.
     static bool IsStartupEnabled()
     {
         try
@@ -334,34 +387,42 @@ public class GameToolsForm : Form
     {
         var s = _cachedSettings ?? SimpleJson.LoadSettings(SettingsPath);
         _cachedSettings = null;
-        if (s.TryGetValue("center", out var v)) chkCenter.Checked = Convert.ToBoolean(v);
-        if (s.TryGetValue("clip", out v)) chkClip.Checked = Convert.ToBoolean(v);
-        if (s.TryGetValue("remove_border", out v)) chkBorder.Checked = Convert.ToBoolean(v);
-        if (s.TryGetValue("black_bg", out v)) chkBlackBg.Checked = Convert.ToBoolean(v);
-        if (s.TryGetValue("mute_bg", out v)) chkMute.Checked = Convert.ToBoolean(v);
-        if (s.TryGetValue("tray_mode", out v)) chkTrayMode.Checked = Convert.ToBoolean(v);
-        if (s.TryGetValue("custom_res", out v)) chkCustomRes.Checked = Convert.ToBoolean(v);
-        if (s.TryGetValue("res_w", out v)) txtResW.Text = v.ToString();
-        if (s.TryGetValue("res_h", out v)) txtResH.Text = v.ToString();
+        ApplyDefaultsFrom(s);
+        if (s.TryGetValue("tray_mode", out var v)) trayMode = Convert.ToBoolean(v);
         ApplyGamepadSettingsToUi(GamepadSettings.FromDict(s));
     }
 
+    // The settings file keeps the new-game defaults under the same keys the old global options used.
+    void ApplyDefaultsFrom(Dictionary<string, object> s)
+    {
+        if (s.TryGetValue("center", out var v)) defaults.Center = Convert.ToBoolean(v);
+        if (s.TryGetValue("clip", out v)) defaults.Clip = Convert.ToBoolean(v);
+        if (s.TryGetValue("remove_border", out v)) defaults.RemoveBorder = Convert.ToBoolean(v);
+        if (s.TryGetValue("black_bg", out v)) defaults.BlackBg = Convert.ToBoolean(v);
+        if (s.TryGetValue("mute_bg", out v)) defaults.MuteBg = Convert.ToBoolean(v);
+        if (s.TryGetValue("custom_res", out v)) defaults.CustomRes = Convert.ToBoolean(v);
+        if (s.TryGetValue("res_w", out v) && int.TryParse(v.ToString(), out int w) && w > 0) defaults.ResW = w;
+        if (s.TryGetValue("res_h", out v) && int.TryParse(v.ToString(), out int h) && h > 0) defaults.ResH = h;
+    }
+
+    Dictionary<string, object> DefaultsDict() => new()
+    {
+        ["center"] = defaults.Center, ["clip"] = defaults.Clip,
+        ["remove_border"] = defaults.RemoveBorder, ["black_bg"] = defaults.BlackBg,
+        ["mute_bg"] = defaults.MuteBg, ["custom_res"] = defaults.CustomRes,
+        ["res_w"] = defaults.ResW, ["res_h"] = defaults.ResH
+    };
+
     void SaveSettings()
     {
-        SimpleJson.SaveSettings(SettingsPath, new Dictionary<string, object>
-        {
-            ["hk_mod"] = (int)hkMod, ["hk_vk"] = (int)hkVk, ["hk_label"] = hkLabel,
-            ["center"] = chkCenter.Checked, ["clip"] = chkClip.Checked,
-            ["remove_border"] = chkBorder.Checked, ["black_bg"] = chkBlackBg.Checked,
-            ["mute_bg"] = chkMute.Checked,
-            ["tray_mode"] = chkTrayMode.Checked,
-            ["custom_res"] = chkCustomRes.Checked,
-            ["res_w"] = txtResW.Text, ["res_h"] = txtResH.Text,
-            ["gp_wasd"] = chkWasd.Checked, ["gp_ramp_up"] = trkRampUp.Value,
-            ["gp_ramp_down"] = trkRampDown.Value, ["gp_mouse"] = chkMouse.Checked,
-            ["gp_sensitivity"] = trkSensitivity.Value,
-            ["gp_invert_rx"] = chkInvertRX.Checked, ["gp_invert_ry"] = chkInvertRY.Checked
-        });
+        var d = DefaultsDict();
+        d["hk_mod"] = (int)hkMod; d["hk_vk"] = (int)hkVk; d["hk_label"] = hkLabel;
+        d["tray_mode"] = trayMode;
+        d["gp_wasd"] = chkWasd.Checked; d["gp_ramp_up"] = trkRampUp.Value;
+        d["gp_ramp_down"] = trkRampDown.Value; d["gp_mouse"] = chkMouse.Checked;
+        d["gp_sensitivity"] = trkSensitivity.Value;
+        d["gp_invert_rx"] = chkInvertRX.Checked; d["gp_invert_ry"] = chkInvertRY.Checked;
+        SimpleJson.SaveSettings(SettingsPath, d);
     }
 
     void LoadProfiles()
@@ -377,36 +438,154 @@ public class GameToolsForm : Form
         SimpleJson.SaveProfiles(ProfilesPath, profiles);
     }
 
+    // ---- Game list ------------------------------------------------------------------------
+
     void RefreshProfileList()
     {
-        profileList.Items.Clear();
-        foreach (var kv in profiles.OrderBy(p => p.Key))
+        if (profileList == null) return;
+        string filter = search.Box.Text.Trim();
+        var rows = profiles
+            .Where(kv => filter.Length == 0
+                || kv.Key.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                || DisplayText.DisplayName(kv.Key).Contains(filter, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(kv => kv.Value.LastUsed)
+            .ThenBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(kv => new ProfileRow(kv.Key, kv.Value) { Running = runningExes.Contains(kv.Key) })
+            .ToList();
+
+        if (selectedExe != null && !profiles.ContainsKey(selectedExe))
         {
-            var item = new ListViewItem(kv.Value.Favorite ? "\u2605" : "");
-            item.SubItems.Add(kv.Key);
-            item.SubItems.Add(kv.Value.Summary());
-            item.Tag = kv.Key;
-            profileList.Items.Add(item);
+            selectedExe = null;
+            detail.ShowEmpty();
+        }
+
+        int sel = rows.FindIndex(r => string.Equals(r.Exe, selectedExe, StringComparison.OrdinalIgnoreCase));
+        profileList.SetItems(rows, sel);
+
+        lblListEmpty.Text = profiles.Count == 0
+            ? "No games yet.\nStart a game, then click Capture window."
+            : $"No games match \u201C{filter}\u201D";
+        lblListEmpty.Visible = rows.Count == 0;
+        profileList.Visible = rows.Count > 0;
+    }
+
+    void OnListSelectionChanged()
+    {
+        if (profileList.SelectedItem is not ProfileRow row) return;
+        selectedExe = row.Exe;
+        ShowSelectedDetail();
+    }
+
+    void ShowSelectedDetail()
+    {
+        if (selectedExe == null || !profiles.TryGetValue(selectedExe, out var p)) { detail.ShowEmpty(); return; }
+        loadingDetail = true;
+        detail.ShowProfile(selectedExe, p, runningExes.Contains(selectedExe));
+        if (Constants.GamepadPluginEnabled) ApplyGamepadSettingsToUi(p.Gamepad);
+        loadingDetail = false;
+    }
+
+    // Selects exe in the list (clearing a search that hides it) and shows it in the detail card.
+    void SelectProfile(string exe)
+    {
+        var key = profiles.Keys.FirstOrDefault(k => string.Equals(k, exe, StringComparison.OrdinalIgnoreCase));
+        if (key == null) return;
+        selectedExe = key;
+        if (search.Box.Text.Length > 0) search.Box.Text = ""; // triggers RefreshProfileList
+        else RefreshProfileList();
+        ShowSelectedDetail();
+    }
+
+    void OnSearchKeyDown(object? sender, KeyEventArgs e)
+    {
+        switch (e.KeyCode)
+        {
+            case Keys.Escape:
+                search.Box.Text = "";
+                e.SuppressKeyPress = true;
+                break;
+            case Keys.Enter:
+            case Keys.Down:
+                if (profileList.Items.Count > 0)
+                {
+                    if (profileList.SelectedIndex < 0) profileList.SelectedIndex = 0;
+                    profileList.Focus();
+                }
+                e.SuppressKeyPress = true;
+                break;
         }
     }
 
-    GameProfile GetCurrentOpts() => new()
+    void OnDetailChanged()
     {
-        Center = chkCenter.Checked, Clip = chkClip.Checked, RemoveBorder = chkBorder.Checked,
-        BlackBg = chkBlackBg.Checked, MuteBg = chkMute.Checked,
-        CustomRes = chkCustomRes.Checked,
-        ResW = int.TryParse(txtResW.Text, out int w) ? w : Constants.DefaultResW,
-        ResH = int.TryParse(txtResH.Text, out int h) ? h : Constants.DefaultResH,
-        Gamepad = GetGamepadSettings()
-    };
+        if (loadingDetail || selectedExe == null || !profiles.TryGetValue(selectedExe, out var p)) return;
+        detail.Options.ReadInto(p);
+        if (Constants.GamepadPluginEnabled) p.Gamepad = GetGamepadSettings();
+        SaveProfiles();
+    }
 
-    void ApplyProfileToUi(GameProfile p)
+    async void RefreshRunning()
     {
-        chkCenter.Checked = p.Center; chkClip.Checked = p.Clip; chkBorder.Checked = p.RemoveBorder;
-        chkBlackBg.Checked = p.BlackBg; chkMute.Checked = p.MuteBg;
-        chkCustomRes.Checked = p.CustomRes;
-        txtResW.Text = p.ResW.ToString(); txtResH.Text = p.ResH.ToString();
-        ApplyGamepadSettingsToUi(p.Gamepad);
+        if (refreshingRunning || !Visible || WindowState == FormWindowState.Minimized) return;
+        refreshingRunning = true;
+        try
+        {
+            var names = await Task.Run(() =>
+            {
+                var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var p in Process.GetProcesses())
+                {
+                    try { set.Add(p.ProcessName + ".exe"); }
+                    catch (Exception) { }
+                    finally { p.Dispose(); }
+                }
+                return set;
+            });
+            if (IsDisposed || names.SetEquals(runningExes)) return;
+            runningExes = names;
+            foreach (var row in profileList.Items) row.Running = runningExes.Contains(row.Exe);
+            profileList.Invalidate();
+            if (selectedExe != null) detail.SetRunning(runningExes.Contains(selectedExe));
+        }
+        catch (Exception ex) { Debug.WriteLine("RefreshRunning: " + ex.Message); }
+        finally { refreshingRunning = false; }
+    }
+
+    // ---- Settings -------------------------------------------------------------------------
+
+    void OpenSettings()
+    {
+        var edited = defaults.Clone();
+        bool startup = IsStartupEnabled();
+        using var f = new SettingsForm(hkLabel, startup, trayMode, edited, ChangeHotkey);
+        f.ShowDialog(this);
+        defaults = edited;
+        if (f.StartWithWindows != startup) SetStartupEnabled(f.StartWithWindows);
+        trayMode = f.TrayMode;
+        SaveSettings();
+        Status("Settings saved");
+    }
+
+    void UpdateHotkeyHint() => lblHotkeyHint.Text = $"Capture: {hkLabel}";
+
+    // ---- Gamepad (optional plugin) --------------------------------------------------------
+
+    Control GamepadPluginGroup(int contentW)
+    {
+        if (!Constants.GamepadPluginEnabled)
+            return new Panel { Size = Size.Empty };
+
+        return Flex.Group("Virtual Gamepad", Theme.Bold, Theme.Accent, 4, contentW,
+            chkGamepad, lblGamepadStatus,
+            chkWasd,
+            Flex.Row(8, Theme.MakeLabel("Ramp Up:"), trkRampUp, lblRampUpVal),
+            Flex.Row(8, Theme.MakeLabel("Ramp Down:"), trkRampDown, lblRampDownVal),
+            chkMouse,
+            Flex.Row(8, Theme.MakeLabel("Sensitivity:"), trkSensitivity, lblSensVal),
+            Flex.Row(8, chkInvertRX, chkInvertRY),
+            Flex.Row(6, lblBarW, barW, lblBarA, barA),
+            Flex.Row(6, lblBarS, barS, lblBarD, barD),
+            btnDebugHid);
     }
 
     GamepadSettings GetGamepadSettings() => new()
@@ -498,54 +677,22 @@ public class GameToolsForm : Form
         lblBarS.Text = $"S:{s}%"; lblBarD.Text = $"D:{d}%";
     }
 
-    Control GamepadPluginGroup(int contentW)
-    {
-        if (!Constants.GamepadPluginEnabled)
-            return new Panel { Size = Size.Empty };
-
-        return Flex.Group("Virtual Gamepad", Theme.Bold, Theme.Accent, 4, contentW,
-            chkGamepad, lblGamepadStatus,
-            chkWasd,
-            Flex.Row(8, Theme.MakeLabel("Ramp Up:"), trkRampUp, lblRampUpVal),
-            Flex.Row(8, Theme.MakeLabel("Ramp Down:"), trkRampDown, lblRampDownVal),
-            chkMouse,
-            Flex.Row(8, Theme.MakeLabel("Sensitivity:"), trkSensitivity, lblSensVal),
-            Flex.Row(8, chkInvertRX, chkInvertRY),
-            Flex.Row(6, lblBarW, barW, lblBarA, barA),
-            Flex.Row(6, lblBarS, barS, lblBarD, barD),
-            btnDebugHid);
-    }
-
-    void SaveCurrentProfile()
-    {
-        if (string.IsNullOrEmpty(targetProcess)) { Status("Capture a window first"); return; }
-        var p = GetCurrentOpts();
-        if (profiles.TryGetValue(targetProcess, out var existing)) p.Favorite = existing.Favorite;
-        profiles[targetProcess] = p;
-        SaveProfiles(); RefreshProfileList();
-
-        try
-        {
-            string saved = File.ReadAllText(ProfilesPath);
-            Status(saved.Contains(targetProcess) ? $"Profile saved: {targetProcess}" : "Save failed - profile not found in file!");
-        }
-        catch (Exception ex) { Status("Save error: " + ex.Message); }
-    }
+    // ---- Profile actions ------------------------------------------------------------------
 
     void ToggleFavorite()
     {
         string? exe = SelectedExe(); if (exe == null) return;
         bool nowFav = profiles[exe].Favorite = !profiles[exe].Favorite;
-        SaveProfiles(); RefreshProfileList();
-        Status($"{exe} {(nowFav ? "favorited" : "unfavorited")}");
+        SaveProfiles();
+        detail.SetFavorite(nowFav);
+        profileList.Invalidate();
+        Status($"{exe} {(nowFav ? "favorited \u2014 settings auto-apply when it starts" : "unfavorited")}");
 
         // Auto-apply immediately if the favorited window is already open
         if (!nowFav) return;
         try
         {
-            var win = WindowHelper.GetWindows()
-                .Where(w => w.Width > Constants.MinWindowSize && w.Height > Constants.MinWindowSize)
-                .FirstOrDefault(w => string.Equals(w.Process, exe, StringComparison.OrdinalIgnoreCase));
+            var win = FindOpenWindow(exe);
             if (win == null) return;
             lock (_appliedPidsLock) appliedPids.Add(win.Pid);
             ApplyProfileActions(win.Hwnd, profiles[exe]);
@@ -553,26 +700,45 @@ public class GameToolsForm : Form
         catch (Exception ex) { Debug.WriteLine("Favorite auto-apply: " + ex.Message); }
     }
 
-    void LoadSelectedProfile()
+    // Applies the selected profile to its game's window, if the game is running.
+    void ApplySelected()
     {
         string? exe = SelectedExe(); if (exe == null) return;
-        ApplyProfileToUi(profiles[exe]);
-        Status($"Loaded settings from {exe}");
+        WindowInfo? win;
+        try { win = FindOpenWindow(exe); }
+        catch (Exception ex) { Status("Window lookup failed: " + ex.Message); return; }
+        if (win == null) { Status($"{exe} is not running \u2014 start the game, then click Apply"); return; }
+        lock (_appliedPidsLock) appliedPids.Add(win.Pid);
+        ApplyProfileActions(win.Hwnd, profiles[exe]);
     }
 
     void DeleteSelectedProfile()
     {
         string? exe = SelectedExe(); if (exe == null) return;
+        if (MessageBox.Show(this, $"Delete the profile for {exe}?", "Delete profile",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
         profiles.Remove(exe);
+        selectedExe = null;
         SaveProfiles(); RefreshProfileList();
+        detail.ShowEmpty();
         Status($"Deleted: {exe}");
     }
 
     string? SelectedExe()
     {
-        if (profileList.SelectedItems.Count == 0) { Status("Select a profile first"); return null; }
-        return profileList.SelectedItems[0].Tag as string;
+        if (selectedExe == null || !profiles.ContainsKey(selectedExe)) { Status("Select a game first"); return null; }
+        return selectedExe;
     }
+
+    static WindowInfo? FindOpenWindow(string exe) =>
+        WindowHelper.GetWindows()
+            .Where(w => w.Width > Constants.MinWindowSize && w.Height > Constants.MinWindowSize)
+            .FirstOrDefault(w => string.Equals(w.Process, exe, StringComparison.OrdinalIgnoreCase));
+
+    GameProfile? TargetProfile() =>
+        targetProcess != null && profiles.TryGetValue(targetProcess, out var p) ? p : null;
+
+    // ---- Capture / apply / release --------------------------------------------------------
 
     void StartCapture()
     {
@@ -623,14 +789,14 @@ public class GameToolsForm : Form
         IntPtr hwnd = Win32.GetForegroundWindow();
         if (hwnd != IntPtr.Zero && Win32.IsWindow(hwnd))
         {
-            targetHwnd = hwnd;
-            SaveOriginalState(hwnd);
             var info = WindowHelper.GetInfo(hwnd);
-            targetProcess = info.Process;
-            targetPid = info.Pid;
-            UpdateTargetDisplay();
-            if (profiles.TryGetValue(targetProcess, out var profile)) ApplyProfileToUi(profile);
-            ApplyActions();
+            if (!profiles.TryGetValue(info.Process, out var profile))
+            {
+                profile = defaults.Clone();
+                profile.Favorite = false;
+                profiles[info.Process] = profile;
+            }
+            ApplyProfileActions(hwnd, profile);
         }
         else Status("No valid window detected");
 
@@ -644,82 +810,49 @@ public class GameToolsForm : Form
     {
         if (targetHwnd == IntPtr.Zero || !Win32.IsWindow(targetHwnd))
         {
-            lblTargetTitle.Text = "(no window selected)";
-            lblTargetInfo.Text = "";
+            lblTarget.Text = "No active game";
+            lblTarget.ForeColor = Theme.Dim;
             return;
         }
         var info = WindowHelper.GetInfo(targetHwnd);
-        var mi = WindowHelper.GetMonitor(targetHwnd);
-        int mw = mi.rcMonitor.Right - mi.rcMonitor.Left, mh = mi.rcMonitor.Bottom - mi.rcMonitor.Top;
-        lblTargetTitle.Text = string.IsNullOrEmpty(info.Title) ? "(untitled)" : info.Title;
-        lblTargetInfo.Text = $"{info.Process}  |  {info.Width}x{info.Height}  |  Monitor {mw}x{mh}";
+        lblTarget.Text = $"\u25CF  {DisplayText.DisplayName(info.Process)}  \u00B7  {info.Width}\u00D7{info.Height}";
+        lblTarget.ForeColor = Theme.Green;
     }
 
-    void ApplyActions()
-    {
-        if (targetHwnd == IntPtr.Zero || !Win32.IsWindow(targetHwnd)) { Status("No target window"); return; }
-        var actions = new List<string>();
-
-        if (chkBorder.Checked) { WindowHelper.RemoveBorder(targetHwnd); Thread.Sleep(Constants.ActionSettleMs); actions.Add("border removed"); }
-
-        if (chkCustomRes.Checked || chkCenter.Checked)
-        {
-            int? tw = null, th = null;
-            if (chkCustomRes.Checked)
-            {
-                if (!int.TryParse(txtResW.Text, out int w2) || !int.TryParse(txtResH.Text, out int h2)) { Status("Invalid resolution"); return; }
-                if (w2 <= 0 || h2 <= 0 || w2 > 15360 || h2 > 8640) { Status("Resolution out of range"); return; }
-                tw = w2; th = h2;
-            }
-            WindowHelper.Center(targetHwnd, tw, th);
-            actions.Add(chkCenter.Checked ? "centered" : "resized");
-            Thread.Sleep(Constants.ActionSettleMs);
-        }
-
-        if (chkClip.Checked) { StartMonitoring(); actions.Add("clip"); }
-        if (chkBlackBg.Checked) { ShowBlackBg(); actions.Add("blackbg"); }
-        UpdateTargetDisplay();
-        SaveSettings();
-
-        if (!string.IsNullOrEmpty(targetProcess))
-        {
-            var p = GetCurrentOpts();
-            if (profiles.TryGetValue(targetProcess, out var existing)) p.Favorite = existing.Favorite;
-            profiles[targetProcess] = p;
-            SaveProfiles(); RefreshProfileList();
-            Status(actions.Count > 0
-                ? $"Applied: {string.Join(", ", actions)} · profile saved: {targetProcess}"
-                : $"Profile saved: {targetProcess}");
-        }
-        else
-        {
-            Status(actions.Count > 0 ? "Applied: " + string.Join(", ", actions) : "No actions selected");
-        }
-    }
-
+    // Single path for every apply: capture, Apply button, favorite toggle and auto-detect.
     void ApplyProfileActions(IntPtr hwnd, GameProfile p)
     {
         if (InvokeRequired) { Invoke(() => ApplyProfileActions(hwnd, p)); return; }
 
-        targetHwnd = hwnd;
         SaveOriginalState(hwnd);
+        targetHwnd = hwnd;
         var info = WindowHelper.GetInfo(hwnd);
         targetProcess = info.Process;
         targetPid = info.Pid;
-        ApplyProfileToUi(p);
+
+        p.LastUsed = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        SaveProfiles();
+        SelectProfile(info.Process);
 
         var actions = new List<string>();
-        if (p.RemoveBorder) { WindowHelper.RemoveBorder(hwnd); Thread.Sleep(Constants.ActionSettleMs); actions.Add("border"); }
+        if (p.RemoveBorder) { WindowHelper.RemoveBorder(hwnd); Thread.Sleep(Constants.ActionSettleMs); actions.Add("border removed"); }
 
-        int? tw = null, th = null;
-        if (p.CustomRes) { tw = p.ResW; th = p.ResH; }
-        if (p.Center) { WindowHelper.Center(hwnd, tw, th); actions.Add("centered"); Thread.Sleep(Constants.ActionSettleMs); }
+        if (p.CustomRes || p.Center)
+        {
+            int? tw = null, th = null;
+            if (p.CustomRes) { tw = p.ResW; th = p.ResH; }
+            WindowHelper.Center(hwnd, tw, th);
+            actions.Add(p.Center ? "centered" : "resized");
+            Thread.Sleep(Constants.ActionSettleMs);
+        }
 
         if (p.Clip) { StartMonitoring(); actions.Add("clip"); }
-        if (p.BlackBg) { ShowBlackBg(); actions.Add("blackbg"); }
+        if (p.BlackBg) { ShowBlackBg(); actions.Add("black bg"); }
         if (p.Gamepad.Enabled && vigemAvailable) { chkGamepad.Checked = true; actions.Add("gamepad"); }
         UpdateTargetDisplay();
-        Status($"Auto-applied: {info.Process} ({string.Join(", ", actions)})");
+        Status(actions.Count > 0
+            ? $"Applied to {info.Process}: {string.Join(", ", actions)}"
+            : $"Captured {info.Process} (no actions enabled)");
     }
 
     void Release()
@@ -777,7 +910,8 @@ public class GameToolsForm : Form
     {
         if (clipRunning) StopMonitoring();
         clipRunning = true;
-        bool useBlack = chkBlackBg.Checked, useMute = chkMute.Checked;
+        var p = TargetProfile() ?? defaults;
+        bool useBlack = p.BlackBg, useMute = p.MuteBg;
         uint pid = targetPid;
         clipThread = new Thread(() => ClipLoop(useBlack, useMute, pid)) { IsBackground = true };
         clipThread.Start();
@@ -852,7 +986,9 @@ public class GameToolsForm : Form
 
             if (clipRunning) continue;
 
-            var favs = profiles.Where(p => p.Value.Favorite).ToDictionary(p => p.Key, p => p.Value, StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, GameProfile> favs;
+            try { favs = (Invoke(() => profiles.Where(p => p.Value.Favorite).ToDictionary(p => p.Key, p => p.Value, StringComparer.OrdinalIgnoreCase)) as Dictionary<string, GameProfile>)!; }
+            catch (Exception) { continue; }
             if (favs.Count == 0) continue;
 
             List<WindowInfo> windows;
@@ -880,6 +1016,8 @@ public class GameToolsForm : Form
         }
     }
 
+    // ---- Window / tray --------------------------------------------------------------------
+
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
@@ -895,7 +1033,7 @@ public class GameToolsForm : Form
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
-        if (WindowState == FormWindowState.Minimized && chkTrayMode?.Checked == true)
+        if (WindowState == FormWindowState.Minimized && trayMode)
         {
             Hide();
             if (trayIcon != null) trayIcon.Visible = true;
@@ -908,6 +1046,7 @@ public class GameToolsForm : Form
         WindowState = FormWindowState.Normal;
         if (trayIcon != null) trayIcon.Visible = false;
         Activate();
+        RefreshRunning();
     }
 
     protected override void WndProc(ref Message m)
@@ -938,45 +1077,53 @@ public class GameToolsForm : Form
         base.WndProc(ref m);
     }
 
-    void ChangeHotkey()
+    // Shows the key-capture dialog over `owner`; returns the (possibly unchanged) hotkey label.
+    string ChangeHotkey(IWin32Window owner)
     {
         Win32.UnregisterHotKey(Handle, HOTKEY_ID);
 
         using var dlg = new Form
         {
-            Text = "Set Hotkey", Size = new Size(340, 140), FormBorderStyle = FormBorderStyle.FixedDialog,
+            Text = "Set Hotkey", FormBorderStyle = FormBorderStyle.FixedDialog,
+            AutoScaleDimensions = new SizeF(96F, 96F), AutoScaleMode = AutoScaleMode.Dpi,
+            ClientSize = new Size(340, 110), ShowInTaskbar = false,
             StartPosition = FormStartPosition.CenterParent, BackColor = Theme.BG, MaximizeBox = false, MinimizeBox = false
         };
-        var lbl = new Label { Text = "Press a key combination...", ForeColor = Theme.FG, Font = new Font("Segoe UI", 13), Location = new Point(20, 15), AutoSize = true };
-        var hint = new Label { Text = "(Ctrl / Alt / Shift + a key)", ForeColor = Theme.Dim, Font = Theme.Normal, Location = new Point(20, 50), AutoSize = true };
+        dlg.HandleCreated += (_, _) => Theme.ApplyWindowChrome(dlg);
+        var lbl = new Label { Text = "Press a key combination\u2026", ForeColor = Theme.FG, Font = Theme.Heading, Location = new Point(24, 24), AutoSize = true };
+        var hint = new Label { Text = "Ctrl / Alt / Shift + a key  \u00B7  Esc to cancel", ForeColor = Theme.Dim, Font = Theme.Caption, Location = new Point(24, 62), AutoSize = true };
         dlg.Controls.Add(lbl); dlg.Controls.Add(hint);
 
         uint newMod = 0, newVk = 0; string? newLabel = null;
         dlg.KeyPreview = true;
         dlg.KeyDown += (_, e) =>
         {
+            if (e.KeyCode == Keys.Escape) { dlg.DialogResult = DialogResult.Cancel; return; }
             if (e.KeyCode is Keys.ControlKey or Keys.ShiftKey or Keys.Menu) return;
             uint mod = 0; var parts = new List<string>();
             if (e.Control) { mod |= Win32.MOD_CONTROL; parts.Add("Ctrl"); }
             if (e.Alt) { mod |= Win32.MOD_ALT; parts.Add("Alt"); }
             if (e.Shift) { mod |= Win32.MOD_SHIFT; parts.Add("Shift"); }
-            if (mod == 0) { hint.Text = "Need at least one modifier!"; hint.ForeColor = Color.FromArgb(243, 139, 168); return; }
+            if (mod == 0) { hint.Text = "Need at least one modifier!"; hint.ForeColor = Theme.Red; return; }
             parts.Add(e.KeyCode.ToString());
             newMod = mod; newVk = (uint)e.KeyCode; newLabel = string.Join("+", parts);
             dlg.DialogResult = DialogResult.OK;
         };
 
-        if (dlg.ShowDialog(this) == DialogResult.OK && newLabel != null)
+        if (dlg.ShowDialog(owner) == DialogResult.OK && newLabel != null)
         {
             hkMod = newMod; hkVk = newVk; hkLabel = newLabel;
-            lblHotkey.Text = hkLabel;
+            UpdateHotkeyHint();
             Status($"Hotkey changed to {hkLabel}");
             SaveSettings();
         }
         else Status("Hotkey change cancelled");
 
         Win32.RegisterHotKey(Handle, HOTKEY_ID, hkMod | Win32.MOD_NOREPEAT, hkVk);
+        return hkLabel;
     }
+
+    // ---- Remote control -------------------------------------------------------------------
 
     void LoadButtonProfiles()
     {
@@ -1003,14 +1150,8 @@ public class GameToolsForm : Form
             {
                 GetSettings = () =>
                 {
-                    var d = new Dictionary<string, object>
-                    {
-                        ["center"] = chkCenter.Checked, ["clip"] = chkClip.Checked,
-                        ["remove_border"] = chkBorder.Checked, ["black_bg"] = chkBlackBg.Checked,
-                        ["mute_bg"] = chkMute.Checked, ["custom_res"] = chkCustomRes.Checked,
-                        ["res_w"] = txtResW.Text, ["res_h"] = txtResH.Text,
-                        ["hk_label"] = hkLabel
-                    };
+                    var d = DefaultsDict();
+                    d["hk_label"] = hkLabel;
                     return d;
                 },
                 UpdateSettings = dict =>
@@ -1054,23 +1195,18 @@ public class GameToolsForm : Form
 
     void UpdateSettingsFromRemote(Dictionary<string, object> dict)
     {
-        if (dict.TryGetValue("center", out var v)) chkCenter.Checked = Convert.ToBoolean(v);
-        if (dict.TryGetValue("clip", out v)) chkClip.Checked = Convert.ToBoolean(v);
-        if (dict.TryGetValue("remove_border", out v)) chkBorder.Checked = Convert.ToBoolean(v);
-        if (dict.TryGetValue("black_bg", out v)) chkBlackBg.Checked = Convert.ToBoolean(v);
-        if (dict.TryGetValue("mute_bg", out v)) chkMute.Checked = Convert.ToBoolean(v);
-        if (dict.TryGetValue("custom_res", out v)) chkCustomRes.Checked = Convert.ToBoolean(v);
-        if (dict.TryGetValue("res_w", out v)) txtResW.Text = v.ToString();
-        if (dict.TryGetValue("res_h", out v)) txtResH.Text = v.ToString();
+        ApplyDefaultsFrom(dict);
         SaveSettings();
-        Status("Settings updated from remote");
+        Status("Default settings updated from remote");
     }
 
     void UpdateProfileFromRemote(string exe, GameProfile profile)
     {
+        if (profile.LastUsed == 0 && profiles.TryGetValue(exe, out var existing)) profile.LastUsed = existing.LastUsed;
         profiles[exe] = profile;
         SaveProfiles();
         RefreshProfileList();
+        if (string.Equals(exe, selectedExe, StringComparison.OrdinalIgnoreCase)) ShowSelectedDetail();
         Status($"Profile updated from remote: {exe}");
     }
 
@@ -1080,6 +1216,13 @@ public class GameToolsForm : Form
         SaveProfiles();
         RefreshProfileList();
         Status($"Profile deleted from remote: {exe}");
+    }
+
+    // Persists a remote toggle of the active game's profile and refreshes the card if it's shown.
+    void SaveTargetProfileChange()
+    {
+        SaveProfiles();
+        if (targetProcess != null && string.Equals(targetProcess, selectedExe, StringComparison.OrdinalIgnoreCase)) ShowSelectedDetail();
     }
 
     void ExecuteRemoteAction(string id)
@@ -1109,18 +1252,25 @@ public class GameToolsForm : Form
                 Status(clipRunning ? "Clip enabled from remote" : "Clip disabled from remote");
                 break;
             case "blackbg":
-                if (chkBlackBg.Checked) { chkBlackBg.Checked = false; HideBlackBg(); }
-                else { chkBlackBg.Checked = true; if (targetHwnd != IntPtr.Zero) ShowBlackBg(); }
-                Status(chkBlackBg.Checked ? "Black BG on (remote)" : "Black BG off (remote)");
+            {
+                var p = TargetProfile();
+                if (p == null) { Status("No active game (remote)"); break; }
+                p.BlackBg = !p.BlackBg;
+                if (p.BlackBg) ShowBlackBg(); else HideBlackBg();
+                SaveTargetProfileChange();
+                Status(p.BlackBg ? "Black BG on (remote)" : "Black BG off (remote)");
                 break;
+            }
             case "remove_border":
-                if (targetHwnd != IntPtr.Zero && Win32.IsWindow(targetHwnd))
-                {
-                    chkBorder.Checked = !chkBorder.Checked;
-                    if (chkBorder.Checked) WindowHelper.RemoveBorder(targetHwnd);
-                }
-                Status(chkBorder.Checked ? "Border removed (remote)" : "Border toggle (remote)");
+            {
+                var p = TargetProfile();
+                if (p == null || !Win32.IsWindow(targetHwnd)) { Status("No active game (remote)"); break; }
+                p.RemoveBorder = !p.RemoveBorder;
+                if (p.RemoveBorder) WindowHelper.RemoveBorder(targetHwnd);
+                SaveTargetProfileChange();
+                Status(p.RemoveBorder ? "Border removed (remote)" : "Border toggle (remote)");
                 break;
+            }
             case "center":
                 if (targetHwnd != IntPtr.Zero && Win32.IsWindow(targetHwnd))
                     WindowHelper.Center(targetHwnd);
@@ -1212,6 +1362,7 @@ public class GameToolsForm : Form
         // Signal the clip loop to stop but don't block on Join — it's a background thread that
         // dies on process exit, and the cursor clip is released below (and by the OS on exit).
         clipRunning = false;
+        try { runningTimer?.Stop(); runningTimer?.Dispose(); } catch { }
         try { Win32.ClipCursor(IntPtr.Zero); } catch (Exception ex) { Debug.WriteLine("Cleanup cursor: " + ex.Message); }
         try { if (targetPid != 0) AudioMuter.SetMute(targetPid, false); } catch (Exception ex) { Debug.WriteLine("Cleanup unmute: " + ex.Message); }
         try
@@ -1236,7 +1387,7 @@ public class GameToolsForm : Form
         try { Win32.UnregisterHotKey(Handle, HOTKEY_ID); } catch (Exception ex) { Debug.WriteLine("Cleanup hotkey: " + ex.Message); }
         try { webServer?.Dispose(); webServer = null; } catch (Exception ex) { Debug.WriteLine("Cleanup webserver: " + ex.Message); }
         // Only settings are saved here; profiles are already persisted on every change
-        // (apply / favorite / save / delete), so re-writing the profiles file on close is
+        // (apply / favorite / edit / delete), so re-writing the profiles file on close is
         // redundant and was causing churn.
         try { SaveSettings(); } catch (Exception ex) { Debug.WriteLine("Cleanup save: " + ex.Message); }
     }
@@ -1245,7 +1396,7 @@ public class GameToolsForm : Form
     {
         // Close (X) / Alt+F4 hides to tray instead of exiting when tray mode is on.
         // The tray "Exit" menu sets `exiting` first so it still quits for real.
-        if (!exiting && e.CloseReason == CloseReason.UserClosing && chkTrayMode?.Checked == true)
+        if (!exiting && e.CloseReason == CloseReason.UserClosing && trayMode)
         {
             e.Cancel = true;
             Hide();
